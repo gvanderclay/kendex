@@ -479,6 +479,8 @@ function releaseProviderTokens(event: string): void {
 // registering wrongly through the legacy overload.
 let nativeProviderInstance: unknown;
 let notifiedNativeUnsupported = false;
+// Set by session_compact; the completion persist must not drop it.
+let piCompactionRebuildPending = false;
 
 function applyProviderRegistration(trigger: string): void {
 	const pi = extensionApi;
@@ -969,7 +971,10 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 	// one-shot has exactly the same non-claim on the record.
 	const persistSession = (next: SessionState | null): void => {
 		if (isReentrant || foreignContext) return;
-		setSharedSession(next && conversationFp ? { conversationFingerprint: conversationFp, ...next } : next);
+		// A compaction-driven rebuild is the one flag that must outlive the fresh record.
+		const carryRebuild = piCompactionRebuildPending && next ? { needsRebuild: true } : {};
+		if (next) piCompactionRebuildPending = false;
+		setSharedSession(next && conversationFp ? { conversationFingerprint: conversationFp, ...next, ...carryRebuild } : next);
 	};
 	const markRebuildForThisQuery = (opts: { forceRotate?: boolean } = {}): void => {
 		if (isReentrant || foreignContext) return;
@@ -1205,6 +1210,7 @@ function streamClaudeAgentSdkInLane(model: Model<any>, context: Context, options
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}, account=${account?.label ?? "legacy"}`);
 				// Fresh record on purpose: a transient mid-turn needsRebuild/forceRotate
 				// must not survive a completed query and force a rebuild next turn.
+				// Compaction is the exception — persistSession carries that flag through.
 				persistSession({ sessionId, cursor, cwd, ...accountScope });
 			}
 			// The failure branch above returned, so reaching here means success.
@@ -1448,6 +1454,7 @@ export default function (pi: ExtensionAPI) {
 		// triggers CC's autocompact-thrashing guard. Force the next
 	// call down the REBUILD path so CC sees the current history.
 	const markRebuild = (event: string) => {
+		if (event === "session_compact") piCompactionRebuildPending = true;
 		const activeSession = getSharedSession();
 		if (ctx().activeQuery) {
 			reportToolResultMismatch(ctx(), event, activeSession?.cwd ?? process.cwd());
